@@ -3,16 +3,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Breites Layout und schneller „erste Pixel“-Render
-st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽", layout="wide")
-
-# Mini-Connectivity-Check (zeigt sofort was an, statt „leerer“ Seite)
-try:
-    requests.get("https://api.openligadb.de/getcurrentgroup/bl1", timeout=5)
-    st.caption("✅ OpenLigaDB erreichbar")
-except Exception:
-    st.warning("⚠️ Konnte OpenLigaDB nicht erreichen. Prüfe Netzwerk/Firewall.")
-
 # ----------------------- Config & Secrets -----------------------
 ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
 REGIONS = "eu,uk"                      # mehrere Buchmacher-Regionen
@@ -161,7 +151,7 @@ def match_events(fixtures, events):
     return mp
 
 # ----------------------- UI ------------------------
-st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽")
+st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽", layout="wide")
 st.title("⚽ Bundesliga Predictor 2025/26 — Web-App (Serverless)")
 
 left, mid, right = st.columns(3)
@@ -174,14 +164,15 @@ with right:
 
 season = 2025
 
-# Auto-Run auf iOS/Safari: einmal direkt rechnen
-run = True
-st.button("Vorhersagen neu berechnen", type="primary", on_click=lambda: None)
-if run:
-    # ... rechnen ...
+# Optional: kleiner Reachability-Hinweis
+try:
+    requests.get("https://api.openligadb.de/getcurrentgroup/bl1", timeout=5)
+    st.caption("✅ OpenLigaDB erreichbar")
+except Exception:
+    st.warning("⚠️ Konnte OpenLigaDB nicht erreichen. Prüfe Netzwerk/Firewall.")
 
+if st.button("Vorhersagen berechnen", type="primary"):
     with st.spinner("Lade Daten & berechne..."):
-        # Fixtures
         md = ol_matchday(season, int(matchday))
         fixtures=[]
         for m in md:
@@ -192,11 +183,9 @@ if run:
             })
         teams = sorted({f["home"] for f in fixtures} | {f["away"] for f in fixtures})
 
-        # Form
         hist = compute_form_history(teams, season, int(matchday), n=n)
         strengths = strengths_from_history(hist)
 
-        # Odds
         events = odds_events() if ODDS_API_KEY else []
         ev_map = match_events(fixtures, events) if events else {}
 
@@ -207,15 +196,11 @@ if run:
             mu_h, mu_a = expected_goals(att_h, def_h, att_a, def_a)
 
             top3, mat = top_k_scores(mu_h, mu_a, k=3, max_goals=6)
-            # 1X2 (nur für Info/Blend)
-            p_model = {
-                "1": float(np.triu(mat,1).sum()),
-                "X": float(np.trace(mat)),
-                "2": float(np.tril(mat,-1).sum())
-            }
+            p_model = {"1": float(np.triu(mat,1).sum()),
+                       "X": float(np.trace(mat)),
+                       "2": float(np.tril(mat,-1).sum())}
             s=sum(p_model.values()); p_model={k:v/s for k,v in p_model.items()} if s>0 else p_model
 
-            # Markt
             p_market=None
             ev_id = ev_map.get((fx["home"], fx["away"], (fx["utc"] or "")[:10]))
             if ev_id:
@@ -225,7 +210,6 @@ if run:
                     payload["away_team"]=payload.get("away_team") or fx["away"]
                     p_market = market_probs(payload)
 
-            # Blend (Info)
             if p_market:
                 p_blend={k: alpha*p_model.get(k,0.0)+(1-alpha)*p_market.get(k,0.0) for k in ["1","X","2"]}
                 ss=sum(p_blend.values()); p_blend={k:v/ss for k,v in p_blend.items()} if ss>0 else p_blend
