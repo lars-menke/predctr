@@ -3,6 +3,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Breites Layout und schneller „erste Pixel“-Render
+st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽", layout="wide")
+
+# Mini-Connectivity-Check (zeigt sofort was an, statt „leerer“ Seite)
+try:
+    requests.get("https://api.openligadb.de/getcurrentgroup/bl1", timeout=5)
+    st.caption("✅ OpenLigaDB erreichbar")
+except Exception:
+    st.warning("⚠️ Konnte OpenLigaDB nicht erreichen. Prüfe Netzwerk/Firewall.")
+
 # ----------------------- Config & Secrets -----------------------
 ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
 REGIONS = "eu,uk"                      # mehrere Buchmacher-Regionen
@@ -163,7 +173,13 @@ with right:
     n = st.slider("N Formspiele", 3, 10, DEFAULT_N, 1)
 
 season = 2025
-if st.button("Vorhersagen berechnen", type="primary"):
+
+# Auto-Run auf iOS/Safari: einmal direkt rechnen
+run = True
+st.button("Vorhersagen neu berechnen", type="primary", on_click=lambda: None)
+if run:
+    # ... rechnen ...
+
     with st.spinner("Lade Daten & berechne..."):
         # Fixtures
         md = ol_matchday(season, int(matchday))
