@@ -5,23 +5,26 @@ import pandas as pd
 import streamlit as st
 
 # ===================== Konfiguration =====================
+# (Odds optional – derzeit nicht benutzt, um Mobil-Hänger zu vermeiden)
 ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
-REGIONS = "eu,uk"  # (Odds optional – App läuft auch ohne)
 
-# Basis-Torniveau (getrennt, verhindert symmetrische Einheitsverteilung)
+# Basis-Torniveau getrennt (verhindert symmetrische Einheitsverteilung)
 BASE_HOME_GOALS = 1.62
 BASE_AWAY_GOALS = 1.28
-HOME_ADV        = 1.30   # <- erhöht, um Heimeffekt realistischer zu machen
+HOME_ADV        = 1.20   # moderater, aber realistisch
 
 # Modell-Feintuning
 DEFAULT_N       = 5
-DECAY_LAMBDA    = 0.30   # neuere Spiele zählen stärker
+DECAY_LAMBDA    = 0.35   # jüngere Spiele zählen stärker
 BETA_SHRINK     = 0.50   # weniger Rückzug zum Ligamittel
 RHO_DC          = 0.04
-DRAW_DEFLATE    = 0.03   # <- leicht reduziert
+DRAW_DEFLATE    = 0.035
 MAX_GOALS       = 8
 MU_CLIP         = 4.5
-TEMP_GAMMA      = 1.40   # <- stärkere Favoriten-Spreizung
+
+# Schärfung
+GAMMA_SCORES    = 1.20   # schärft die Score-Matrix (Top/2./3. klarer)
+GAMMA_1X2       = 1.35   # schärft die 1X2-Wahrscheinlichkeiten (Favoriten stärker)
 
 st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽", layout="wide")
 
@@ -58,6 +61,7 @@ def extract_ft(m: dict):
             return r.get("pointsTeam1"), r.get("pointsTeam2"), when
     return None, None, when
 
+# ---- Dixon–Coles + Draw-Deflate auf Score-Matrix ----
 def dixon_coles_adjust(M: np.ndarray, rho=RHO_DC, draw_deflate=DRAW_DEFLATE) -> np.ndarray:
     A = M.copy()
     n_i, n_j = A.shape
@@ -80,13 +84,20 @@ def score_matrix(mu_h, mu_a, max_goals=MAX_GOALS, apply_dc=True):
     M = np.outer(home, away)
     return dixon_coles_adjust(M) if apply_dc else M
 
+def sharpen_matrix(M: np.ndarray, gamma: float = GAMMA_SCORES) -> np.ndarray:
+    """Schärft die Score-Matrix: M' = M^γ / Σ M^γ  (γ>1 → Spitzen werden betont)."""
+    A = np.clip(M, 1e-15, 1.0) ** float(gamma)
+    s = A.sum()
+    return A / s if s > 0 else M
+
 def top_k_scores(mu_h, mu_a, k=3):
     M = score_matrix(mu_h, mu_a, MAX_GOALS, apply_dc=True)
+    M = sharpen_matrix(M, GAMMA_SCORES)  # NEU: schärfen für klarere Tops
     scores = [((i,j), float(M[i,j])) for i in range(MAX_GOALS+1) for j in range(MAX_GOALS+1)]
     scores.sort(key=lambda x: x[1], reverse=True)
     return scores[:k], M
 
-def temp_scale_1x2(probs: dict, gamma: float = TEMP_GAMMA) -> dict:
+def temp_scale_1x2(probs: dict, gamma: float = GAMMA_1X2) -> dict:
     """Temperatur-Skalierung: p'^ = p^γ / Σ p^γ (γ>1 → Favoriten stärker)."""
     v = np.array([probs.get("1",0.0), probs.get("X",0.0), probs.get("2",0.0)], dtype=float)
     v = np.clip(v, 1e-12, 1.0)
@@ -188,11 +199,13 @@ def run_backtest(season, start_md, end_md, n_form=DEFAULT_N):
                 strengths.get(a,{"att_away":1,"def_away":1})["att_away"],
                 strengths.get(h,{"att_home":1,"def_home":1})["def_home"]
             )
+            # Score-Matrix schärfen
             _, M = top_k_scores(mu_h, mu_a)
+            # 1X2 aus (geschärfter) Matrix
             probs = {"1": float(np.triu(M,1).sum()), "X": float(np.trace(M)), "2": float(np.tril(M,-1).sum())}
             s = sum(probs.values())
             if s > 0: probs = {k:v/s for k,v in probs.items()}
-            probs = temp_scale_1x2(probs, gamma=TEMP_GAMMA)
+            probs = temp_scale_1x2(probs, gamma=GAMMA_1X2)
 
             outcome = "1" if g1>g2 else "2" if g2>g1 else "X"
             bs = brier_score(probs, outcome); ll = log_loss(probs, outcome)
@@ -203,7 +216,7 @@ def run_backtest(season, start_md, end_md, n_form=DEFAULT_N):
     df = pd.DataFrame(rows)
     return df, (float(np.mean(bs_list)) if bs_list else None), (float(np.mean(ll_list)) if ll_list else None)
 
-# ===================== UI (mobil-robuster Auto-Run) =====================
+# ===================== UI (stabiler Auto-Run) =====================
 tab_pred, tab_back = st.tabs(["🔮 Vorhersage", "📊 Backtest"])
 
 with tab_pred:
@@ -218,15 +231,13 @@ with tab_pred:
 
     season = 2025
 
-    # iOS/Safari: Auto-Run beim ersten Render + Failsafe (nie „leer“)
-    if "booted" not in st.session_state:
+    # iOS/Safari: Auto-Run NUR beim ersten Render (verhindert Endlos-Neu-Rendern)
+    first_boot = "booted" not in st.session_state
+    if first_boot:
         st.session_state["booted"] = True
-        auto_run = True
-    else:
-        auto_run = False
 
     recalc = st.button("Vorhersagen berechnen", type="primary")
-    run = auto_run or recalc or True  # Failsafe: rechnen, damit immer Inhalte erscheinen
+    run = first_boot or recalc  # <-- kein permanentes True mehr!
 
     if run:
         with st.spinner("Lade Daten & berechne..."):
@@ -255,11 +266,11 @@ with tab_pred:
                     s_h["att_home"], s_a["def_away"], s_a["att_away"], s_h["def_home"]
                 )
                 top3, M = top_k_scores(mu_h, mu_a)
-                # 1X2 (temperiert – optional einblendbar)
+                # 1X2 (aus geschärfter Matrix), dann temperatur-skaliert
                 p = {"1": float(np.triu(M,1).sum()), "X": float(np.trace(M)), "2": float(np.tril(M,-1).sum())}
                 s = sum(p.values())
                 if s > 0: p = {k:v/s for k,v in p.items()}
-                p = temp_scale_1x2(p, gamma=TEMP_GAMMA)
+                p = temp_scale_1x2(p, gamma=GAMMA_1X2)
 
                 rows.append({
                     "Heim": fx["home"], "Gast": fx["away"], "Anstoß": fx["utc"],
@@ -267,7 +278,7 @@ with tab_pred:
                     "Top": f"{top3[0][0][0]}:{top3[0][0][1]}", "P(Top)%": round(top3[0][1]*100,1),
                     "2.":  f"{top3[1][0][0]}:{top3[1][0][1]}", "P2%":    round(top3[1][1]*100,1),
                     "3.":  f"{top3[2][0][0]}:{top3[2][0][1]}", "P3%":    round(top3[2][1]*100,1),
-                    # Optional sichtbare 1X2:
+                    # Optional sichtbare 1X2 (auskommentiert – kannst du aktivieren):
                     # "P(1)": round(p["1"],2), "P(X)": round(p["X"],2), "P(2)": round(p["2"],2)
                 })
 
