@@ -11,6 +11,9 @@ DEFAULT_N = 5                          # Formfenster
 LEAGUE_AVG = 2.9                       # Ligamittel Tore/Spiel
 HOME_ADV = 1.1                         # Heimvorteil-Faktor
 
+# Seite für Mobile optimieren
+st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽", layout="wide")
+
 # ----------------------- Small cache ----------------------------
 @st.cache_data(show_spinner=False, ttl=300)
 def http_get_json(url, params=None, timeout=30):
@@ -25,8 +28,10 @@ def ol_matchday(season: int, matchday: int):
 def odds_events():
     if not ODDS_API_KEY:
         return []
-    return http_get_json("https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/events",
-                         params={"apiKey": ODDS_API_KEY})
+    return http_get_json(
+        "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/events",
+        params={"apiKey": ODDS_API_KEY}
+    )
 
 def odds_single_event(event_id: str):
     if not ODDS_API_KEY:
@@ -151,7 +156,6 @@ def match_events(fixtures, events):
     return mp
 
 # ----------------------- UI ------------------------
-st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽", layout="wide")
 st.title("⚽ Bundesliga Predictor 2025/26 — Web-App (Serverless)")
 
 left, mid, right = st.columns(3)
@@ -164,15 +168,21 @@ with right:
 
 season = 2025
 
-# Optional: kleiner Reachability-Hinweis
+# Reachability-Hinweis (zeigt sofort „etwas“ an)
 try:
     requests.get("https://api.openligadb.de/getcurrentgroup/bl1", timeout=5)
     st.caption("✅ OpenLigaDB erreichbar")
 except Exception:
     st.warning("⚠️ Konnte OpenLigaDB nicht erreichen. Prüfe Netzwerk/Firewall.")
 
-if st.button("Vorhersagen berechnen", type="primary"):
+# ----------------------- Safari/iOS Fix: Auto-Run -----------------------
+# Immer sofort rechnen (kein leeres UI bei verschluckten Button-Events)
+run = True
+st.button("Vorhersagen neu berechnen", type="primary", help="Berechnet mit aktuellen Parametern neu.")
+
+if run:
     with st.spinner("Lade Daten & berechne..."):
+        # Fixtures
         md = ol_matchday(season, int(matchday))
         fixtures=[]
         for m in md:
@@ -183,12 +193,15 @@ if st.button("Vorhersagen berechnen", type="primary"):
             })
         teams = sorted({f["home"] for f in fixtures} | {f["away"] for f in fixtures})
 
+        # Form
         hist = compute_form_history(teams, season, int(matchday), n=n)
         strengths = strengths_from_history(hist)
 
+        # Odds
         events = odds_events() if ODDS_API_KEY else []
         ev_map = match_events(fixtures, events) if events else {}
 
+        # Ergebnisse sammeln
         rows=[]
         for fx in fixtures:
             att_h, def_h = strengths[fx["home"]]
@@ -196,10 +209,14 @@ if st.button("Vorhersagen berechnen", type="primary"):
             mu_h, mu_a = expected_goals(att_h, def_h, att_a, def_a)
 
             top3, mat = top_k_scores(mu_h, mu_a, k=3, max_goals=6)
+
+            # 1X2 nur als Zusatzinfo/Blend
             p_model = {"1": float(np.triu(mat,1).sum()),
                        "X": float(np.trace(mat)),
                        "2": float(np.tril(mat,-1).sum())}
-            s=sum(p_model.values()); p_model={k:v/s for k,v in p_model.items()} if s>0 else p_model
+            s=sum(p_model.values())
+            if s>0:
+                p_model={k:v/s for k,v in p_model.items()}
 
             p_market=None
             ev_id = ev_map.get((fx["home"], fx["away"], (fx["utc"] or "")[:10]))
@@ -212,10 +229,13 @@ if st.button("Vorhersagen berechnen", type="primary"):
 
             if p_market:
                 p_blend={k: alpha*p_model.get(k,0.0)+(1-alpha)*p_market.get(k,0.0) for k in ["1","X","2"]}
-                ss=sum(p_blend.values()); p_blend={k:v/ss for k,v in p_blend.items()} if ss>0 else p_blend
+                ss=sum(p_blend.values())
+                if ss>0:
+                    p_blend={k:v/ss for k,v in p_blend.items()}
                 alpha_used=alpha
             else:
-                p_blend=p_model; alpha_used=1.0
+                p_blend=p_model
+                alpha_used=1.0
 
             rows.append({
                 "Heim": fx["home"], "Gast": fx["away"], "Anstoß (UTC)": fx["utc"],
@@ -228,5 +248,3 @@ if st.button("Vorhersagen berechnen", type="primary"):
 
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
         st.caption("Hinweis: Wenn keine Quoten für eine Partie vorliegen, wird automatisch nur das Modell (α=1.0) genutzt. Keine Wettberatung – verantwortungsbewusst spielen.")
-else:
-    st.info("Spieltag wählen und auf „Vorhersagen berechnen“ klicken.")
