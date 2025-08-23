@@ -11,7 +11,7 @@ REGIONS = "eu,uk"  # (Odds optional – App läuft auch ohne)
 # Basis-Torniveau (getrennt: verhindert 1:1-/1:0-Einheitsbrei)
 BASE_HOME_GOALS = 1.62
 BASE_AWAY_GOALS = 1.28
-HOME_ADV        = 1.15
+HOME_ADV        = 1.25
 
 # Modell-Feintuning
 DEFAULT_N       = 5
@@ -21,7 +21,7 @@ RHO_DC          = 0.04
 DRAW_DEFLATE    = 0.045
 MAX_GOALS       = 8
 MU_CLIP         = 4.5
-TEMP_GAMMA      = 1.25   # Temperatur-Skalierung (Favoriten stärker)
+TEMP_GAMMA      = 1.35   # Temperatur-Skalierung (Favoriten stärker)
 
 st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽", layout="wide")
 
