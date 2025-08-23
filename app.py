@@ -7,18 +7,18 @@ import streamlit as st
 ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
 REGIONS = "eu,uk"
 
-# Modell-Defaults (einfach oben zentral anpassen)
-LEAGUE_AVG = 2.9          # durchschnittliche Tore / Spiel in der Liga
-HOME_ADV   = 1.1          # Heimvorteil-Faktor
-DEFAULT_N  = 5            # wie viele Formspiele
-BASE_ALPHA = 0.6          # Baseline Blend (Modell vs. Markt)
-DECAY_LAMBDA = 0.25       # Zeitgewichtung (pro Woche): höher = jüngere Spiele zählen stärker
-BETA_SHRINK  = 3.0        # Shrinkage in "Pseudo-Spielen" Richtung Ligamittel
-RHO_DC       = 0.06       # Dixon-Coles-Rho (>0 reduziert 0:0/1:1 leicht, erhöht 1:0/0:1)
+# Modell-Defaults
+LEAGUE_AVG   = 2.9      # durchschnittliche Tore / Spiel
+HOME_ADV     = 1.12     # etwas stärkerer Heimvorteil
+DEFAULT_N    = 5        # Formfenster
+BASE_ALPHA   = 0.6      # Modell- vs. Markt-Blend (Basis)
+DECAY_LAMBDA = 0.22     # Zeitgewichtung pro Woche
+BETA_SHRINK  = 1.0      # moderates Shrinkage (vorher 3.0)
+RHO_DC       = 0.05     # Dixon-Coles-Korrektur
 
 st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽", layout="wide")
 
-# ===================== Caching-Wrapper =====================
+# ===================== Caching =====================
 @st.cache_data(show_spinner=False, ttl=300)
 def http_get_json(url, params=None, timeout=30):
     r = requests.get(url, params=params, timeout=timeout)
@@ -45,7 +45,7 @@ def odds_single_event(event_id: str):
         params={"apiKey": ODDS_API_KEY, "regions": REGIONS, "markets": "h2h", "oddsFormat": "decimal"}
     )
 
-# ===================== Helper / Modell =====================
+# ===================== Helpers / Modell =====================
 def normalize_name(s: str) -> str:
     s0 = s.lower()
     s0 = unicodedata.normalize('NFKD', s0).encode('ascii','ignore').decode('ascii')
@@ -70,7 +70,6 @@ def parse_date(s: str) -> dt.datetime | None:
         return None
 
 def extract_ft(m: dict):
-    # Fulltime-Result (resultTypeID==2); gebe auch Match-Datum zurück
     when = m.get("matchDateTimeUTC") or m.get("matchDateTime") or ""
     for r in m.get("matchResults") or []:
         if r.get("resultTypeID")==2:
@@ -80,23 +79,17 @@ def extract_ft(m: dict):
 def weeks_between(later: dt.datetime, earlier: dt.datetime) -> float:
     return max(0.0, (later - earlier).total_seconds() / (7*24*3600))
 
-# ---- Dixon-Coles-Korrektur für Low-Score-Zellen ----
+# ---- Dixon-Coles-Korrektur (vereinfachte Variante) ----
 def dixon_coles_adjust(mat: np.ndarray, rho: float = RHO_DC) -> np.ndarray:
-    # Kopie, nur 4 Zellen modifizieren: (0,0), (1,0), (0,1), (1,1)
     M = mat.copy()
-    max_i, max_j = M.shape
-    # Sicherheits-Guards
-    if max_i < 2 or max_j < 2 or rho == 0.0:
+    if M.shape[0] < 2 or M.shape[1] < 2 or rho == 0.0:
         return M
-    # Faktoren (vereinfachte DC-Variante): weniger 0:0 & 1:1, etwas mehr 1:0 & 0:1
     M[0,0] *= (1.0 - rho)
     M[1,1] *= (1.0 - rho)
     M[1,0] *= (1.0 + rho)
     M[0,1] *= (1.0 + rho)
-    # Renormieren
     s = M.sum()
-    if s > 0:
-        M /= s
+    if s > 0: M /= s
     return M
 
 def poisson_pmf(lmbda, k): 
@@ -144,32 +137,27 @@ def market_probs_and_confidence(odds_payload):
             arr=sorted(arr)
             med = arr[len(arr)//2]
             probs[k]=1.0/med
-            spreads.append((max(arr)-min(arr))/max(arr))  # relative Spanne
+            spreads.append((max(arr)-min(arr))/max(arr))
     s=sum(probs.values())
     if s>0:
         probs={k:v/s for k,v in probs.items()}
 
-    # Confidence in [0,1]: viele Bookies & kleine Spreads => hohe Confidence
-    c_books = min(1.0, n_books/6.0)           # 6+ Bookies => 1.0
-    c_spread = 1.0 - min(0.5, (np.mean(spreads) if spreads else 0.5))  # mittlere Spanne klein -> nah 1
-    confidence = 0.6*c_books + 0.4*c_spread   # simple Mischung
+    c_books = min(1.0, n_books/6.0)
+    c_spread = 1.0 - min(0.5, (np.mean(spreads) if spreads else 0.5))
+    confidence = 0.6*c_books + 0.4*c_spread
     return probs, float(max(0.0, min(1.0, confidence)))
 
 def dynamic_alpha(base_alpha: float, confidence: float) -> float:
-    # Hohe Markt-Confidence => niedrigere α (mehr Markt), bei niedriger Confidence => höheres α (mehr Modell)
-    # Skala:  α = 0.3 + 0.7*(1 - confidence), danach leicht Richtung base_alpha blenden
     a = 0.3 + 0.7*(1.0 - confidence)
     return float(0.5*a + 0.5*base_alpha)
 
-# ===================== Form-Historie (zeitgewichtet + Shrinkage) =====================
+# ===================== Form-Historie (Zeitgewichtung + Shrinkage, H/A-getrennt) =====================
 def compute_form_history(teams, season, matchday, n=DEFAULT_N):
     """
-    Liefert pro Team eine Liste von Tupeln:
-      (goals_for, goals_against, match_datetime)
-    aus der laufenden Saison rückwärts und ggf. Vorjahres-Fallback.
+    pro Team: Liste (gf, ga, when, is_home)
     """
     out = {t: [] for t in teams}
-    # 1) aktuelle Saison rückwärts
+    # aktuelle Saison rückwärts
     d, steps = matchday-1, 0
     while d>=1 and steps<10 and any(len(out[t])<n for t in teams):
         for m in ol_matchday(season, d):
@@ -177,10 +165,10 @@ def compute_form_history(teams, season, matchday, n=DEFAULT_N):
             t2 = m.get("team2",{}).get("teamName")
             g1,g2,when = extract_ft(m)
             if g1 is None: continue
-            if t1 in out and len(out[t1])<n: out[t1].append((g1,g2, when))
-            if t2 in out and len(out[t2])<n: out[t2].append((g2,g1, when))
+            if t1 in out and len(out[t1])<n: out[t1].append((g1,g2, when, True))   # t1 war heim
+            if t2 in out and len(out[t2])<n: out[t2].append((g2,g1, when, False))  # t2 war auswärts
         d -= 1; steps += 1
-    # 2) Vorjahres-Fallback
+    # Vorjahres-Fallback
     if any(len(out[t])<n for t in teams):
         prev, d, steps = season-1, 34, 0
         while d>=1 and steps<12 and any(len(out[t])<n for t in teams):
@@ -189,59 +177,71 @@ def compute_form_history(teams, season, matchday, n=DEFAULT_N):
                 t2 = m.get("team2",{}).get("teamName")
                 g1,g2,when = extract_ft(m)
                 if g1 is None: continue
-                if t1 in out and len(out[t1])<n: out[t1].append((g1,g2, when))
-                if t2 in out and len(out[t2])<n: out[t2].append((g2,g1, when))
+                if t1 in out and len(out[t1])<n: out[t1].append((g1,g2, when, True))
+                if t2 in out and len(out[t2])<n: out[t2].append((g2,g1, when, False))
             d -= 1; steps += 1
     return out
 
-def strengths_from_history(history: dict, league_avg=LEAGUE_AVG, decay_lambda=DECAY_LAMBDA, beta=BETA_SHRINK,
-                           ref_date: dt.datetime | None = None):
+def _weighted_means(records, ref_dt, decay_lambda, beta, avg_side):
     """
-    Zeitgewichtete Attack/Defense mit Shrinkage.
-    w_i = exp(-lambda * Wochen_seit_Spiel)
-    Shrinkage: Pseudo-Spiele (beta) Richtung Ligamittel (avg_side).
+    records: Liste (gf, ga, when_str, is_home)
+    gibt gewichtete gf, ga zurück (mit Shrinkage)
+    """
+    ws, gfs, gas = [], [], []
+    for gf, ga, when_str, _ in records:
+        when_dt = parse_date(when_str) or ref_dt
+        weeks = weeks_between(ref_dt, when_dt)
+        w = math.exp(-decay_lambda * weeks)
+        ws.append(w); gfs.append(float(gf)); gas.append(float(ga))
+    sum_w = sum(ws) if ws else 0.0
+    if sum_w <= 0:
+        return avg_side, avg_side
+    gf_w = float(np.dot(ws, gfs) / sum_w)
+    ga_w = float(np.dot(ws, gas) / sum_w)
+    # Shrinkage Richtung Ligamittel
+    gf_sm = (gf_w*sum_w + beta*avg_side) / (sum_w + beta)
+    ga_sm = (ga_w*sum_w + beta*avg_side) / (sum_w + beta)
+    return gf_sm, ga_sm
+
+def strengths_from_history(history: dict, ref_date: dt.datetime | None,
+                           league_avg=LEAGUE_AVG, decay_lambda=DECAY_LAMBDA, beta=BETA_SHRINK):
+    """
+    Liefert je Team:
+      att_home, def_home, att_away, def_away
     """
     avg_side = league_avg/2.0
     out={}
-    # Referenzdatum: heute, falls nicht vom Fixture gesetzt
     ref = ref_date or dt.datetime.utcnow()
 
     for team, arr in history.items():
         if not arr:
-            out[team]=(1.0,1.0); continue
+            out[team] = dict(att_home=1.0, def_home=1.0, att_away=1.0, def_away=1.0)
+            continue
 
-        # Gewichte berechnen
-        ws = []
-        gf_list, ga_list = [], []
-        for gf, ga, when_str in arr:
-            when_dt = parse_date(when_str) or ref
-            weeks = weeks_between(ref, when_dt)
-            w = math.exp(-decay_lambda * weeks)
-            ws.append(w); gf_list.append(float(gf)); ga_list.append(float(ga))
+        home_recs  = [r for r in arr if r[3] is True]
+        away_recs  = [r for r in arr if r[3] is False]
+        # Fallback: wenn ein Split leer ist, nutze Gesamt (verhindert Null-Varianz)
+        both_recs  = arr
 
-        sum_w = sum(ws) if ws else 0.0
-        if sum_w <= 0:
-            out[team]=(1.0,1.0); continue
+        # Heim
+        gf_h, ga_h = _weighted_means(home_recs or both_recs, ref, decay_lambda, beta, avg_side)
+        att_home   = max(0.2, gf_h / max(0.1, avg_side))
+        def_home   = max(0.2, max(0.1, avg_side) / max(0.1, ga_h))
 
-        # gewichtete Mittelwerte
-        gf_w = float(np.dot(ws, gf_list) / sum_w)
-        ga_w = float(np.dot(ws, ga_list) / sum_w)
+        # Auswärts
+        gf_a, ga_a = _weighted_means(away_recs or both_recs, ref, decay_lambda, beta, avg_side)
+        att_away   = max(0.2, gf_a / max(0.1, avg_side))
+        def_away   = max(0.2, max(0.1, avg_side) / max(0.1, ga_a))
 
-        # Shrinkage Richtung Ligamittel (Pseudo-Spiele beta)
-        gf_sm = (gf_w*sum_w + beta*avg_side) / (sum_w + beta)
-        ga_sm = (ga_w*sum_w + beta*avg_side) / (sum_w + beta)
-
-        # in Faktoren übersetzen
-        att  = max(0.2, gf_sm / max(0.1, avg_side))
-        deff = max(0.2, max(0.1, avg_side) / max(0.1, ga_sm))
-
-        out[team]=(att, deff)
+        out[team] = dict(att_home=att_home, def_home=def_home,
+                         att_away=att_away, def_away=def_away)
     return out
 
-def expected_goals(att_h, def_h, att_a, def_a, home_adv=HOME_ADV, base=LEAGUE_AVG):
-    mu_h = home_adv * att_h * (1/def_a) * (base/2.0)
-    mu_a = (1/home_adv) * att_a * (1/def_h) * (base/2.0)
-    return float(np.clip(mu_h, 0.1, 3.5)), float(np.clip(mu_a, 0.1, 3.5))
+def expected_goals_home_away(h_att_home, a_def_away, a_att_away, h_def_home,
+                             home_adv=HOME_ADV, base=LEAGUE_AVG):
+    mu_h = home_adv       * h_att_home * (1.0 / a_def_away) * (base/2.0)
+    mu_a = (1.0/home_adv) * a_att_away * (1.0 / h_def_home) * (base/2.0)
+    return float(np.clip(mu_h, 0.1, 3.8)), float(np.clip(mu_a, 0.1, 3.8))
 
 # ===================== UI =====================
 st.title("⚽ Bundesliga Predictor 2025/26 — Web-App (Serverless)")
@@ -256,20 +256,19 @@ with right:
 
 season = 2025
 
-# kleines Reachability-Signal (zeigt sofort „etwas“ an)
+# Reachability
 try:
     requests.get("https://api.openligadb.de/getcurrentgroup/bl1", timeout=5)
     st.caption("✅ OpenLigaDB erreichbar")
 except Exception:
     st.warning("⚠️ Konnte OpenLigaDB nicht erreichen. Prüfe Netzwerk/Firewall.")
 
-# ---- iOS-Safari Fix: Auto-Run ohne Gate ----
+# ---- iOS-Safari Fix: Auto-Run ----
 run = True
 st.button("Vorhersagen neu berechnen", type="primary", help="Berechnet mit aktuellen Parametern neu.")
 
 if run:
     with st.spinner("Lade Daten & berechne..."):
-        # Fixtures + Referenzdatum (für Zeitgewichtung)
         md = ol_matchday(season, int(matchday))
         fixtures=[]
         for m in md:
@@ -279,16 +278,14 @@ if run:
                 "utc":  m.get("matchDateTimeUTC") or m.get("matchDateTime") or ""
             })
         teams = sorted({f["home"] for f in fixtures} | {f["away"] for f in fixtures})
-        # Referenzdatum: erster Fixture-Zeitpunkt (falls vorhanden), sonst jetzt
         ref_dt = parse_date(fixtures[0]["utc"]) if fixtures and fixtures[0]["utc"] else dt.datetime.utcnow()
 
-        # Form (zeitgewichtet + Shrinkage)
+        # Form (H/A-getrennt)
         hist = compute_form_history(teams, season, int(matchday), n=n)
         strengths = strengths_from_history(hist, ref_date=ref_dt)
 
-        # Markt (Events → je Spiel payload)
+        # Markt (Events)
         events = odds_events() if ODDS_API_KEY else []
-        # schnelle Map: (home_norm, away_norm, date_key) -> event_id
         ev_map={}
         for ev in events:
             k = (normalize_name(ev.get("home_team","")), normalize_name(ev.get("away_team","")), (ev.get("commence_time","") or "")[:10])
@@ -296,11 +293,13 @@ if run:
 
         rows=[]
         for fx in fixtures:
-            att_h, def_h = strengths[fx["home"]]
-            att_a, def_a = strengths[fx["away"]]
-            mu_h, mu_a = expected_goals(att_h, def_h, att_a, def_a)
+            s_h = strengths[fx["home"]]
+            s_a = strengths[fx["away"]]
+            mu_h, mu_a = expected_goals_home_away(
+                s_h["att_home"], s_a["def_away"], s_a["att_away"], s_h["def_home"]
+            )
 
-            # Score-Matrix inkl. Dixon-Coles
+            # Score-Matrix inkl. DC
             top3, mat = top_k_scores(mu_h, mu_a, k=3, max_goals=6)
             # 1X2 aus Modell
             p_model = {"1": float(np.triu(mat,1).sum()),
@@ -316,7 +315,6 @@ if run:
             key = (normalize_name(fx["home"]), normalize_name(fx["away"]), (fx["utc"] or "")[:10])
             ev_id = ev_map.get(key)
             if not ev_id:
-                # toleranter Abgleich (±1 Tag)
                 for ev in events:
                     if normalize_name(ev.get("home_team",""))==key[0] and normalize_name(ev.get("away_team",""))==key[1] \
                        and same_or_adjacent_day(fx["utc"], ev.get("commence_time","")):
