@@ -8,20 +8,20 @@ import streamlit as st
 ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
 REGIONS = "eu,uk"  # (Odds optional – App läuft auch ohne)
 
-# Basis-Torniveau (getrennt: verhindert 1:1-/1:0-Einheitsbrei)
+# Basis-Torniveau (getrennt, verhindert symmetrische Einheitsverteilung)
 BASE_HOME_GOALS = 1.62
 BASE_AWAY_GOALS = 1.28
-HOME_ADV        = 1.25
+HOME_ADV        = 1.30   # <- erhöht, um Heimeffekt realistischer zu machen
 
 # Modell-Feintuning
 DEFAULT_N       = 5
 DECAY_LAMBDA    = 0.30   # neuere Spiele zählen stärker
 BETA_SHRINK     = 0.50   # weniger Rückzug zum Ligamittel
 RHO_DC          = 0.04
-DRAW_DEFLATE    = 0.045
+DRAW_DEFLATE    = 0.03   # <- leicht reduziert
 MAX_GOALS       = 8
 MU_CLIP         = 4.5
-TEMP_GAMMA      = 1.35   # Temperatur-Skalierung (Favoriten stärker)
+TEMP_GAMMA      = 1.40   # <- stärkere Favoriten-Spreizung
 
 st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽", layout="wide")
 
@@ -203,7 +203,7 @@ def run_backtest(season, start_md, end_md, n_form=DEFAULT_N):
     df = pd.DataFrame(rows)
     return df, (float(np.mean(bs_list)) if bs_list else None), (float(np.mean(ll_list)) if ll_list else None)
 
-# ===================== UI (mit robustem Auto-Run) =====================
+# ===================== UI (mobil-robuster Auto-Run) =====================
 tab_pred, tab_back = st.tabs(["🔮 Vorhersage", "📊 Backtest"])
 
 with tab_pred:
@@ -218,7 +218,7 @@ with tab_pred:
 
     season = 2025
 
-    # iOS/Safari: „echter“ Auto-Run – beim ersten Render einmalig rechnen
+    # iOS/Safari: Auto-Run beim ersten Render + Failsafe (nie „leer“)
     if "booted" not in st.session_state:
         st.session_state["booted"] = True
         auto_run = True
@@ -226,7 +226,7 @@ with tab_pred:
         auto_run = False
 
     recalc = st.button("Vorhersagen berechnen", type="primary")
-    run = auto_run or recalc or True  # failsafe, damit nie „leer“ bleibt
+    run = auto_run or recalc or True  # Failsafe: rechnen, damit immer Inhalte erscheinen
 
     if run:
         with st.spinner("Lade Daten & berechne..."):
@@ -255,7 +255,7 @@ with tab_pred:
                     s_h["att_home"], s_a["def_away"], s_a["att_away"], s_h["def_home"]
                 )
                 top3, M = top_k_scores(mu_h, mu_a)
-                # 1X2 (für Anzeige ggf. nützlich)
+                # 1X2 (temperiert – optional einblendbar)
                 p = {"1": float(np.triu(M,1).sum()), "X": float(np.trace(M)), "2": float(np.tril(M,-1).sum())}
                 s = sum(p.values())
                 if s > 0: p = {k:v/s for k,v in p.items()}
@@ -267,7 +267,7 @@ with tab_pred:
                     "Top": f"{top3[0][0][0]}:{top3[0][0][1]}", "P(Top)%": round(top3[0][1]*100,1),
                     "2.":  f"{top3[1][0][0]}:{top3[1][0][1]}", "P2%":    round(top3[1][1]*100,1),
                     "3.":  f"{top3[2][0][0]}:{top3[2][0][1]}", "P3%":    round(top3[2][1]*100,1),
-                    # optional: 1X2 anzeigen – hier auskommentiert
+                    # Optional sichtbare 1X2:
                     # "P(1)": round(p["1"],2), "P(X)": round(p["X"],2), "P(2)": round(p["2"],2)
                 })
 
