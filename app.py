@@ -3,51 +3,57 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ===================== Konfiguration & Secrets =====================
+# ===================== Config & Secrets =====================
 ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", "")).strip()
 REGIONS = "eu,uk"
 
-# Modell-Defaults
-LEAGUE_AVG   = 2.9      # durchschnittliche Tore / Spiel
-HOME_ADV     = 1.12     # etwas stärkerer Heimvorteil
-DEFAULT_N    = 5        # Formfenster
-BASE_ALPHA   = 0.6      # Modell- vs. Markt-Blend (Basis)
-DECAY_LAMBDA = 0.22     # Zeitgewichtung pro Woche
-BETA_SHRINK  = 1.0      # moderates Shrinkage (vorher 3.0)
-RHO_DC       = 0.05     # Dixon-Coles-Korrektur
+# Kern-Parameter (bewusst etwas „mutiger“ gewählt, um 1:1-Bias zu brechen)
+BASE_HOME_GOALS = 1.62   # Basis-Heimtore je Team
+BASE_AWAY_GOALS = 1.28   # Basis-Auswärtstore je Team
+HOME_ADV        = 1.15   # Heimvorteil stärker
+DEFAULT_N       = 5
+BASE_ALPHA      = 0.6
+DECAY_LAMBDA    = 0.22   # Zeitgewicht pro Woche
+BETA_SHRINK     = 0.6    # moderat (weniger Einheitsbrei)
+RHO_DC          = 0.04   # leichte DC-Korrektur (Low Scores)
+DRAW_DEFLATE    = 0.02   # kleine Draw-Deflation auf Diagonale
 
 st.set_page_config(page_title="Bundesliga Predictor 25/26", page_icon="⚽", layout="wide")
 
-# ===================== Caching =====================
+# ===================== HTTP (mit festen Timeouts) =====================
 @st.cache_data(show_spinner=False, ttl=300)
-def http_get_json(url, params=None, timeout=30):
+def http_get_json(url, params=None, timeout=7):
     r = requests.get(url, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
-# ===================== Datenquellen =====================
 def ol_matchday(season: int, matchday: int):
-    return http_get_json(f"https://api.openligadb.de/getmatchdata/bl1/{season}/{matchday}")
+    return http_get_json(f"https://api.openligadb.de/getmatchdata/bl1/{season}/{matchday}", timeout=7)
 
 def odds_events():
-    if not ODDS_API_KEY:
+    if not ODDS_API_KEY: return []
+    try:
+        return http_get_json(
+            "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/events",
+            params={"apiKey": ODDS_API_KEY}, timeout=7
+        )
+    except Exception:
         return []
-    return http_get_json(
-        "https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/events",
-        params={"apiKey": ODDS_API_KEY}
-    )
 
 def odds_single_event(event_id: str):
-    if not ODDS_API_KEY:
+    if not ODDS_API_KEY: return {}
+    try:
+        return http_get_json(
+            f"https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/events/{event_id}/odds",
+            params={"apiKey": ODDS_API_KEY, "regions": REGIONS, "markets": "h2h", "oddsFormat": "decimal"},
+            timeout=7
+        )
+    except Exception:
         return {}
-    return http_get_json(
-        f"https://api.the-odds-api.com/v4/sports/soccer_germany_bundesliga/events/{event_id}/odds",
-        params={"apiKey": ODDS_API_KEY, "regions": REGIONS, "markets": "h2h", "oddsFormat": "decimal"}
-    )
 
 # ===================== Helpers / Modell =====================
 def normalize_name(s: str) -> str:
-    s0 = s.lower()
+    s0 = (s or "").lower()
     s0 = unicodedata.normalize('NFKD', s0).encode('ascii','ignore').decode('ascii')
     s0 = re.sub(r'\b(fc|sc|sv|vfb|vfl|tsg|rb|1\.|bayer 04|bayer|borussia|hertha bsc|1 fsv|fsv|union)\b','', s0)
     s0 = re.sub(r'[^a-z0-9]+','', s0)
@@ -62,8 +68,7 @@ def same_or_adjacent_day(utc1: str, utc2: str) -> bool:
         return (utc1 or "")[:10] == (utc2 or "")[:10]
 
 def parse_date(s: str) -> dt.datetime | None:
-    if not s:
-        return None
+    if not s: return None
     try:
         return dt.datetime.fromisoformat(s.replace("Z",""))
     except Exception:
@@ -79,20 +84,25 @@ def extract_ft(m: dict):
 def weeks_between(later: dt.datetime, earlier: dt.datetime) -> float:
     return max(0.0, (later - earlier).total_seconds() / (7*24*3600))
 
-# ---- Dixon-Coles-Korrektur (vereinfachte Variante) ----
-def dixon_coles_adjust(mat: np.ndarray, rho: float = RHO_DC) -> np.ndarray:
+# ---- Dixon-Coles + Draw-Deflate ----
+def dixon_coles_adjust(mat: np.ndarray, rho: float = RHO_DC, draw_deflate: float = DRAW_DEFLATE) -> np.ndarray:
     M = mat.copy()
-    if M.shape[0] < 2 or M.shape[1] < 2 or rho == 0.0:
-        return M
-    M[0,0] *= (1.0 - rho)
-    M[1,1] *= (1.0 - rho)
-    M[1,0] *= (1.0 + rho)
-    M[0,1] *= (1.0 + rho)
+    n_i, n_j = M.shape
+    if n_i >= 2 and n_j >= 2 and rho != 0.0:
+        # DC: leichte Korrektur auf Low Scores
+        M[0,0] *= (1.0 - rho)
+        M[1,1] *= (1.0 - rho)
+        M[1,0] *= (1.0 + rho)
+        M[0,1] *= (1.0 + rho)
+    # leichte Draw-Deflation über gesamte Diagonale
+    if draw_deflate > 0.0:
+        for d in range(min(n_i, n_j)):
+            M[d, d] *= (1.0 - draw_deflate)
     s = M.sum()
     if s > 0: M /= s
     return M
 
-def poisson_pmf(lmbda, k): 
+def poisson_pmf(lmbda, k):
     return (lmbda**k)*math.exp(-lmbda)/math.factorial(k)
 
 def score_matrix(mu_h, mu_a, max_goals=6, apply_dc=True):
@@ -100,7 +110,7 @@ def score_matrix(mu_h, mu_a, max_goals=6, apply_dc=True):
     away = [poisson_pmf(mu_a,j) for j in range(max_goals+1)]
     M = np.outer(home, away)
     if apply_dc:
-        M = dixon_coles_adjust(M, RHO_DC)
+        M = dixon_coles_adjust(M, RHO_DC, DRAW_DEFLATE)
     return M
 
 def top_k_scores(mu_h, mu_a, k=3, max_goals=6):
@@ -109,17 +119,15 @@ def top_k_scores(mu_h, mu_a, k=3, max_goals=6):
     scores.sort(key=lambda x: x[1], reverse=True)
     return scores[:k], mat
 
-# ---- Markt-Probs & Confidence (für dynamisches α) ----
+# ---- Markt-Probs + Confidence → dynamisches α ----
 def market_probs_and_confidence(odds_payload):
     by_outcome={"1":[], "X":[], "2":[]}
-    if not isinstance(odds_payload, dict):
-        return {}, 0.0
+    if not isinstance(odds_payload, dict): return {}, 0.0
     n_books = 0
     for bm in odds_payload.get("bookmakers",[]):
         had_h2h = False
         for mkt in bm.get("markets",[]):
-            if mkt.get("key")!="h2h": 
-                continue
+            if mkt.get("key")!="h2h": continue
             had_h2h = True
             for sel in mkt.get("outcomes",[]):
                 name=str(sel.get("name","")); price=sel.get("price")
@@ -127,21 +135,15 @@ def market_probs_and_confidence(odds_payload):
                 if name==odds_payload.get("home_team"): by_outcome["1"].append(price)
                 elif name==odds_payload.get("away_team"): by_outcome["2"].append(price)
                 elif name.lower() in ("draw","unentschieden"): by_outcome["X"].append(price)
-        if had_h2h:
-            n_books += 1
-
-    probs={}
-    spreads=[]
+        if had_h2h: n_books += 1
+    probs={}; spreads=[]
     for k,arr in by_outcome.items():
         if arr:
-            arr=sorted(arr)
-            med = arr[len(arr)//2]
+            arr=sorted(arr); med=arr[len(arr)//2]
             probs[k]=1.0/med
             spreads.append((max(arr)-min(arr))/max(arr))
     s=sum(probs.values())
-    if s>0:
-        probs={k:v/s for k,v in probs.items()}
-
+    if s>0: probs={k:v/s for k,v in probs.items()}
     c_books = min(1.0, n_books/6.0)
     c_spread = 1.0 - min(0.5, (np.mean(spreads) if spreads else 0.5))
     confidence = 0.6*c_books + 0.4*c_spread
@@ -151,7 +153,7 @@ def dynamic_alpha(base_alpha: float, confidence: float) -> float:
     a = 0.3 + 0.7*(1.0 - confidence)
     return float(0.5*a + 0.5*base_alpha)
 
-# ===================== Form-Historie (Zeitgewichtung + Shrinkage, H/A-getrennt) =====================
+# ===================== Form: zeitgewichtet + Shrinkage, H/A-getrennt =====================
 def compute_form_history(teams, season, matchday, n=DEFAULT_N):
     """
     pro Team: Liste (gf, ga, when, is_home)
@@ -165,8 +167,8 @@ def compute_form_history(teams, season, matchday, n=DEFAULT_N):
             t2 = m.get("team2",{}).get("teamName")
             g1,g2,when = extract_ft(m)
             if g1 is None: continue
-            if t1 in out and len(out[t1])<n: out[t1].append((g1,g2, when, True))   # t1 war heim
-            if t2 in out and len(out[t2])<n: out[t2].append((g2,g1, when, False))  # t2 war auswärts
+            if t1 in out and len(out[t1])<n: out[t1].append((g1,g2, when, True))
+            if t2 in out and len(out[t2])<n: out[t2].append((g2,g1, when, False))
         d -= 1; steps += 1
     # Vorjahres-Fallback
     if any(len(out[t])<n for t in teams):
@@ -183,15 +185,10 @@ def compute_form_history(teams, season, matchday, n=DEFAULT_N):
     return out
 
 def _weighted_means(records, ref_dt, decay_lambda, beta, avg_side):
-    """
-    records: Liste (gf, ga, when_str, is_home)
-    gibt gewichtete gf, ga zurück (mit Shrinkage)
-    """
     ws, gfs, gas = [], [], []
     for gf, ga, when_str, _ in records:
         when_dt = parse_date(when_str) or ref_dt
-        weeks = weeks_between(ref_dt, when_dt)
-        w = math.exp(-decay_lambda * weeks)
+        w = math.exp(-decay_lambda * weeks_between(ref_dt, when_dt))
         ws.append(w); gfs.append(float(gf)); gas.append(float(ga))
     sum_w = sum(ws) if ws else 0.0
     if sum_w <= 0:
@@ -204,44 +201,42 @@ def _weighted_means(records, ref_dt, decay_lambda, beta, avg_side):
     return gf_sm, ga_sm
 
 def strengths_from_history(history: dict, ref_date: dt.datetime | None,
-                           league_avg=LEAGUE_AVG, decay_lambda=DECAY_LAMBDA, beta=BETA_SHRINK):
+                           base_home=BASE_HOME_GOALS, base_away=BASE_AWAY_GOALS,
+                           decay_lambda=DECAY_LAMBDA, beta=BETA_SHRINK):
     """
-    Liefert je Team:
+    Liefert je Team vier Faktoren:
       att_home, def_home, att_away, def_away
     """
-    avg_side = league_avg/2.0
     out={}
     ref = ref_date or dt.datetime.utcnow()
-
     for team, arr in history.items():
         if not arr:
             out[team] = dict(att_home=1.0, def_home=1.0, att_away=1.0, def_away=1.0)
             continue
+        home_recs = [r for r in arr if r[3] is True]
+        away_recs = [r for r in arr if r[3] is False]
+        both_recs = arr
 
-        home_recs  = [r for r in arr if r[3] is True]
-        away_recs  = [r for r in arr if r[3] is False]
-        # Fallback: wenn ein Split leer ist, nutze Gesamt (verhindert Null-Varianz)
-        both_recs  = arr
+        # Heim (gegen base_home)
+        gf_h, ga_h = _weighted_means(home_recs or both_recs, ref, decay_lambda, beta, base_home)
+        att_home = max(0.2, gf_h / max(0.1, base_home))
+        def_home = max(0.2, max(0.1, base_home) / max(0.1, ga_h))
 
-        # Heim
-        gf_h, ga_h = _weighted_means(home_recs or both_recs, ref, decay_lambda, beta, avg_side)
-        att_home   = max(0.2, gf_h / max(0.1, avg_side))
-        def_home   = max(0.2, max(0.1, avg_side) / max(0.1, ga_h))
-
-        # Auswärts
-        gf_a, ga_a = _weighted_means(away_recs or both_recs, ref, decay_lambda, beta, avg_side)
-        att_away   = max(0.2, gf_a / max(0.1, avg_side))
-        def_away   = max(0.2, max(0.1, avg_side) / max(0.1, ga_a))
+        # Auswärts (gegen base_away)
+        gf_a, ga_a = _weighted_means(away_recs or both_recs, ref, decay_lambda, beta, base_away)
+        att_away = max(0.2, gf_a / max(0.1, base_away))
+        def_away = max(0.2, max(0.1, base_away) / max(0.1, ga_a))
 
         out[team] = dict(att_home=att_home, def_home=def_home,
                          att_away=att_away, def_away=def_away)
     return out
 
 def expected_goals_home_away(h_att_home, a_def_away, a_att_away, h_def_home,
-                             home_adv=HOME_ADV, base=LEAGUE_AVG):
-    mu_h = home_adv       * h_att_home * (1.0 / a_def_away) * (base/2.0)
-    mu_a = (1.0/home_adv) * a_att_away * (1.0 / h_def_home) * (base/2.0)
-    return float(np.clip(mu_h, 0.1, 3.8)), float(np.clip(mu_a, 0.1, 3.8))
+                             home_adv=HOME_ADV,
+                             base_home=BASE_HOME_GOALS, base_away=BASE_AWAY_GOALS):
+    mu_h = home_adv       * h_att_home * (1.0 / a_def_away) * base_home
+    mu_a = (1.0/home_adv) * a_att_away * (1.0 / h_def_home) * base_away
+    return float(np.clip(mu_h, 0.1, 4.2)), float(np.clip(mu_a, 0.1, 4.2))
 
 # ===================== UI =====================
 st.title("⚽ Bundesliga Predictor 2025/26 — Web-App (Serverless)")
@@ -256,20 +251,31 @@ with right:
 
 season = 2025
 
-# Reachability
+# Sofortiges Signal
 try:
     requests.get("https://api.openligadb.de/getcurrentgroup/bl1", timeout=5)
     st.caption("✅ OpenLigaDB erreichbar")
 except Exception:
     st.warning("⚠️ Konnte OpenLigaDB nicht erreichen. Prüfe Netzwerk/Firewall.")
 
-# ---- iOS-Safari Fix: Auto-Run ----
-run = True
-st.button("Vorhersagen neu berechnen", type="primary", help="Berechnet mit aktuellen Parametern neu.")
+# ---- iOS: echter Auto-Run via SessionState ----
+if "booted" not in st.session_state:
+    st.session_state["booted"] = True
+    auto_run = True
+else:
+    auto_run = False
+
+recalc = st.button("Vorhersagen neu berechnen", type="primary", help="Berechnet mit aktuellen Parametern neu.")
+run = auto_run or recalc or True  # True = auch manuell laden ohne Button (failsafe)
 
 if run:
     with st.spinner("Lade Daten & berechne..."):
-        md = ol_matchday(season, int(matchday))
+        # Fixtures
+        md = []
+        try:
+            md = ol_matchday(season, int(matchday))
+        except Exception:
+            md = []
         fixtures=[]
         for m in md:
             fixtures.append({
@@ -280,11 +286,11 @@ if run:
         teams = sorted({f["home"] for f in fixtures} | {f["away"] for f in fixtures})
         ref_dt = parse_date(fixtures[0]["utc"]) if fixtures and fixtures[0]["utc"] else dt.datetime.utcnow()
 
-        # Form (H/A-getrennt)
-        hist = compute_form_history(teams, season, int(matchday), n=n)
+        # Form (H/A getrennt)
+        hist = compute_form_history(teams, season, int(matchday), n=n) if teams else {}
         strengths = strengths_from_history(hist, ref_date=ref_dt)
 
-        # Markt (Events)
+        # Markt (Events, nie blockierend)
         events = odds_events() if ODDS_API_KEY else []
         ev_map={}
         for ev in events:
@@ -293,25 +299,24 @@ if run:
 
         rows=[]
         for fx in fixtures:
-            s_h = strengths[fx["home"]]
-            s_a = strengths[fx["away"]]
+            s_h = strengths.get(fx["home"], dict(att_home=1.0, def_home=1.0, att_away=1.0, def_away=1.0))
+            s_a = strengths.get(fx["away"], dict(att_home=1.0, def_home=1.0, att_away=1.0, def_away=1.0))
             mu_h, mu_a = expected_goals_home_away(
                 s_h["att_home"], s_a["def_away"], s_a["att_away"], s_h["def_home"]
             )
 
-            # Score-Matrix inkl. DC
+            # Score-Matrix (mit DC + Draw-Deflate)
             top3, mat = top_k_scores(mu_h, mu_a, k=3, max_goals=6)
+
             # 1X2 aus Modell
             p_model = {"1": float(np.triu(mat,1).sum()),
                        "X": float(np.trace(mat)),
                        "2": float(np.tril(mat,-1).sum())}
             s=sum(p_model.values())
-            if s>0:
-                p_model={k:v/s for k,v in p_model.items()}
+            if s>0: p_model={k:v/s for k,v in p_model.items()}
 
-            # Markt + dynamisches α
-            p_market=None
-            confidence=0.0
+            # Markt + dynamisches α (non-blocking)
+            p_market=None; confidence=0.0
             key = (normalize_name(fx["home"]), normalize_name(fx["away"]), (fx["utc"] or "")[:10])
             ev_id = ev_map.get(key)
             if not ev_id:
@@ -330,12 +335,10 @@ if run:
                 alpha = dynamic_alpha(base_alpha, confidence)
                 p_blend={k: alpha*p_model.get(k,0.0)+(1-alpha)*p_market.get(k,0.0) for k in ["1","X","2"]}
                 ss=sum(p_blend.values())
-                if ss>0:
-                    p_blend={k:v/ss for k,v in p_blend.items()}
+                if ss>0: p_blend={k:v/ss for k,v in p_blend.items()}
                 alpha_used=alpha
             else:
-                p_blend=p_model
-                alpha_used=1.0
+                p_blend=p_model; alpha_used=1.0
 
             rows.append({
                 "Heim": fx["home"], "Gast": fx["away"], "Anstoß (UTC)": fx["utc"],
@@ -346,5 +349,8 @@ if run:
                 "α genutzt": round(alpha_used,2)
             })
 
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-        st.caption("Hinweis: Wenn keine Quoten für eine Partie vorliegen, wird automatisch nur das Modell (α=1.0) genutzt. Keine Wettberatung – verantwortungsbewusst spielen.")
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            st.caption("Hinweis: Wenn keine Quoten für eine Partie vorliegen, wird automatisch nur das Modell (α=1.0) genutzt. Keine Wettberatung – verantwortungsbewusst spielen.")
+        else:
+            st.warning("Keine Fixtures gefunden. Prüfe Saison/Spieltag.")
